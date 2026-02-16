@@ -6,17 +6,17 @@ A web agent that retrieves Google Ads campaign data and analyzes it with Gemini 
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                 React Frontend                   │
-│  Dashboard │ AI Analysis │ AI Chat               │
+│                 React Frontend                  │
+│  Dashboard │ AI Analysis │ AI Chat              │
 │  (Recharts, Lucide, React Query)                │
 └────────────────────┬────────────────────────────┘
                      │ REST API
 ┌────────────────────┴────────────────────────────┐
-│                 FastAPI Backend                   │
-│  /api/campaigns │ /api/analyze │ /api/chat       │
+│                 FastAPI Backend                 │
+│  /api/campaigns │ /api/analyze │ /api/chat      │
 ├───────────┬─────────────────────┬───────────────┤
-│ Google Ads│                     │  Gemini AI     │
-│    SDK    │      SQLite DB      │    (Flash)     │
+│ Google Ads│                     │  Gemini AI    │
+│    SDK    │      SQLite DB      │    (Flash)    │
 └───────────┴─────────────────────┴───────────────┘
 ```
 
