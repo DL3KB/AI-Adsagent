@@ -27,11 +27,22 @@ from app.models.schemas import (
     MetricChange,
     AuditLogEntry,
     DeviceLocationReport,
+    TrendReport,
+    HourlyReport,
+    AdPerformanceReport,
+    NgramReport,
+    LandingPageReport,
 )
 from app.services import google_ads_service, gemini_service, google_ads_mutations
 from app.services.cache_service import log_action, get_audit_log, get_audit_log_count, cache_clear
 
 router = APIRouter(prefix="/api", tags=["campaigns"])
+
+
+@router.get("/token-usage")
+def get_token_usage():
+    """Get current session Gemini API token usage stats."""
+    return gemini_service.get_token_usage()
 
 
 @router.get("/campaigns", response_model=CampaignOverview)
@@ -140,6 +151,131 @@ def get_segmentation(
             date_range=date_range,
             campaign_ids=campaign_ids,
             location_limit=location_limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# DAILY TRENDS
+# ============================================================
+
+@router.get("/trends", response_model=TrendReport)
+def get_trends(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    campaign_id: Optional[str] = Query(None),
+):
+    """Day-by-day performance trends."""
+    try:
+        date_range = None
+        if start_date and end_date:
+            date_range = DateRange(start_date=start_date, end_date=end_date)
+        return google_ads_service.get_daily_trends(
+            date_range=date_range, campaign_id=campaign_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# HOURLY PERFORMANCE
+# ============================================================
+
+@router.get("/hourly", response_model=HourlyReport)
+def get_hourly(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    campaign_id: Optional[str] = Query(None),
+):
+    """Performance distribution by hour of day."""
+    try:
+        date_range = None
+        if start_date and end_date:
+            date_range = DateRange(start_date=start_date, end_date=end_date)
+        return google_ads_service.get_hourly_performance(
+            date_range=date_range, campaign_id=campaign_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# AD COPY PERFORMANCE
+# ============================================================
+
+@router.get("/ads", response_model=AdPerformanceReport)
+def get_ads(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    campaign_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=10, le=500),
+):
+    """Ad-level performance including headlines and descriptions."""
+    try:
+        date_range = None
+        if start_date and end_date:
+            date_range = DateRange(start_date=start_date, end_date=end_date)
+        return google_ads_service.get_ad_performance(
+            date_range=date_range, campaign_id=campaign_id, limit=limit
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# N-GRAM ANALYSIS
+# ============================================================
+
+@router.get("/ngrams", response_model=NgramReport)
+def get_ngrams(
+    campaign_id: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    min_n: int = Query(1, ge=1, le=3),
+    max_n: int = Query(3, ge=1, le=4),
+    min_frequency: int = Query(2, ge=1, le=50),
+    limit: int = Query(100, ge=10, le=500),
+):
+    """N-gram analysis of search terms — find common word patterns."""
+    try:
+        date_range = None
+        if start_date and end_date:
+            date_range = DateRange(start_date=start_date, end_date=end_date)
+
+        return google_ads_service.get_ngram_analysis(
+            campaign_id=campaign_id,
+            date_range=date_range,
+            min_n=min_n,
+            max_n=max_n,
+            min_frequency=min_frequency,
+            limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# LANDING PAGE PERFORMANCE
+# ============================================================
+
+@router.get("/landing-pages", response_model=LandingPageReport)
+def get_landing_pages(
+    campaign_id: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    limit: int = Query(50, ge=5, le=200),
+):
+    """Landing page performance — see which URLs convert best."""
+    try:
+        date_range = None
+        if start_date and end_date:
+            date_range = DateRange(start_date=start_date, end_date=end_date)
+
+        return google_ads_service.get_landing_page_performance(
+            campaign_id=campaign_id,
+            date_range=date_range,
+            limit=limit,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -367,6 +503,12 @@ def clear_cache():
     return {"status": "ok", "message": "Cache geleert"}
 
 
+@router.get("/models")
+def get_models():
+    """Return available Gemini models."""
+    return gemini_service.get_available_models()
+
+
 @router.post("/analyze", response_model=AnalysisResponse)
 def analyze_campaigns(request: AnalysisRequest):
     """Run AI analysis on campaign data."""
@@ -384,8 +526,9 @@ def analyze_campaigns(request: AnalysisRequest):
                 detail="Keine Kampagnendaten für den gewählten Zeitraum gefunden.",
             )
 
-        # Fetch keywords for deeper analysis
-        keywords = google_ads_service.get_keywords(date_range=date_range)
+        # Fetch keywords for deeper analysis (filtered to selected campaigns)
+        campaign_id = request.campaign_ids[0] if request.campaign_ids and len(request.campaign_ids) == 1 else None
+        keywords = google_ads_service.get_keywords(date_range=date_range, campaign_id=campaign_id)
 
         # Fetch ad groups for each campaign
         ad_groups = []
@@ -395,12 +538,25 @@ def analyze_campaigns(request: AnalysisRequest):
             )
             ad_groups.extend(ag)
 
-        # Run AI analysis
+        # Fetch trend and hourly data for deeper context
+        trend_report = google_ads_service.get_daily_trends(date_range=date_range, campaign_id=campaign_id)
+        hourly_report = google_ads_service.get_hourly_performance(date_range=date_range, campaign_id=campaign_id)
+        ad_report = google_ads_service.get_ad_performance(date_range=date_range, campaign_id=campaign_id, limit=30)
+
+        # Fetch negative keywords to show what's already been excluded
+        negative_keywords = google_ads_service.get_negative_keywords(campaign_id=campaign_id)
+
+        # Run AI analysis with enriched data
         analysis = gemini_service.analyze_campaigns(
             overview=overview,
             keywords=keywords,
             ad_groups=ad_groups,
             focus_areas=request.focus_areas,
+            trend_data=trend_report,
+            hourly_data=hourly_report,
+            ad_data=ad_report,
+            model_name=request.model,
+            negative_keywords=negative_keywords,
         )
 
         # Store proposals for later execution
@@ -420,6 +576,8 @@ def chat_about_campaigns(
     question: str = Query(..., description="Your question about the campaign data"),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
+    model: Optional[str] = Query(None, description="Gemini model to use"),
+    campaign_id: Optional[str] = Query(None, description="Filter to specific campaign"),
 ):
     """Ask a question about your campaign data."""
     try:
@@ -427,13 +585,17 @@ def chat_about_campaigns(
         if start_date and end_date:
             date_range = DateRange(start_date=start_date, end_date=end_date)
 
-        overview = google_ads_service.get_campaigns(date_range=date_range)
-        keywords = google_ads_service.get_keywords(date_range=date_range)
+        campaign_ids = [campaign_id] if campaign_id else None
+        overview = google_ads_service.get_campaigns(date_range=date_range, campaign_ids=campaign_ids)
+        keywords = google_ads_service.get_keywords(date_range=date_range, campaign_id=campaign_id)
+        negative_keywords = google_ads_service.get_negative_keywords(campaign_id=campaign_id)
 
         response = gemini_service.chat_about_campaigns(
             overview=overview,
             user_question=question,
             keywords=keywords,
+            model_name=model,
+            negative_keywords=negative_keywords,
         )
 
         return {"answer": response}

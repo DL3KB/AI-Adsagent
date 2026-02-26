@@ -7,10 +7,15 @@ Optimization approach:
 2. Use structured analysis framework (not open-ended)
 3. Force step-by-step reasoning with expert prompt
 4. Highlight red flags in data so AI focuses on what matters
+5. Cache AI responses keyed on data hash — avoid re-analysis of unchanged data
+6. Filter low-value keywords before sending to AI
+7. Use compact data summary for chat to reduce per-message tokens
+8. Track token usage for cost visibility
 """
 
 import google.generativeai as genai
 import json
+import hashlib
 import logging
 from typing import Optional
 from statistics import mean, stdev
@@ -23,18 +28,22 @@ from app.models.schemas import (
     AnalysisResponse,
     Proposal,
     ProposalAction,
+    TrendReport,
+    HourlyReport,
+    AdPerformanceReport,
+    NegativeKeyword,
 )
+from app.services.cache_service import cache_get, cache_set
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# SYSTEM PROMPT — Expert PPC Strategist
-# ============================================================
-SYSTEM_PROMPT = """Du bist ein Senior Google Ads Strategist mit 15+ Jahren Erfahrung im Performance Marketing.
-Du arbeitest methodisch und datengetrieben. Deine Analysen sind präzise, konkret und sofort umsetzbar.
+# Token usage tracking
+_token_usage: dict[str, int] = {"analysis_calls": 0, "chat_calls": 0, "total_input_tokens": 0, "total_output_tokens": 0}
 
-## DEINE ANALYSE-METHODIK
+# Maximum keywords to send to Gemini (filter low-value ones)
+MAX_KEYWORDS_FOR_AI = 80
 
+SYSTEM_PROMPT = """Du bist ein erfahrener Google Ads Analyst und Berater.
 Du gehst bei jeder Analyse systematisch diese 6 Checkpoints durch:
 
 ### 1. BUDGET-EFFIZIENZ
@@ -74,6 +83,18 @@ Du gehst bei jeder Analyse systematisch diese 6 Checkpoints durch:
 - Ad Groups mit nur 1-2 Keywords (zu wenig Daten)
 - Kampagnen ohne Conversions (Tracking-Problem?)
 - Sofort umsetzbare Verbesserungen (< 30 Min Aufwand)
+
+### 7. TREND-ANALYSE (wenn Tagestrends vorhanden)
+- Steigen oder fallen die Kosten im Zeitverlauf?
+- Gibt es Tageszeiten mit besonders hohen/niedrigen Conversion Rates?
+- Ad Scheduling Empfehlungen: Wann Gebote erhöhen, wann senken?
+- Wochentagsmuster: Gibt es Unterschiede zwischen Wochentagen?
+
+### 8. ANZEIGEN-ANALYSE (wenn Anzeigendaten vorhanden)
+- Welche Anzeigen haben die beste/schlechteste CTR?
+- Gibt es Anzeigen mit vielen Klicks aber 0 Conversions?
+- Headline-Muster: Welche Headlines funktionieren gut?
+- Empfehlungen für bessere Anzeigentexte
 
 ## RESPONSE FORMAT
 
@@ -185,6 +206,66 @@ def _configure_gemini():
     genai.configure(api_key=settings.gemini_api_key)
 
 
+def _track_token_usage(response, call_type: str = "analysis"):
+    """Track token usage from a Gemini response for cost monitoring."""
+    try:
+        usage = response.usage_metadata
+        input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        _token_usage[f"{call_type}_calls"] += 1
+        _token_usage["total_input_tokens"] += input_tokens
+        _token_usage["total_output_tokens"] += output_tokens
+        logger.info(
+            f"Gemini [{call_type}] tokens — input: {input_tokens:,}, output: {output_tokens:,} "
+            f"| session totals — calls: {_token_usage[f'{call_type}_calls']}, "
+            f"in: {_token_usage['total_input_tokens']:,}, out: {_token_usage['total_output_tokens']:,}"
+        )
+    except Exception:
+        pass  # Don't fail if usage metadata isn't available
+
+
+def get_token_usage() -> dict:
+    """Return current session token usage stats."""
+    return dict(_token_usage)
+
+
+def _data_hash(data: str) -> str:
+    """Create a short hash of data for cache key dedup."""
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+def _filter_keywords_for_ai(keywords: list[KeywordMetrics]) -> list[KeywordMetrics]:
+    """
+    Filter keywords to only those with analytical value.
+    Keeps keywords that have meaningful data and caps the total count.
+    This dramatically reduces token usage without losing insight quality.
+    """
+    if not keywords:
+        return []
+
+    # Always include: keywords with spend or conversions (actionable)
+    valuable = [kw for kw in keywords if kw.clicks > 0 or kw.conversions > 0]
+
+    # Also include: keywords with low quality score (need attention)
+    low_qs = [kw for kw in keywords
+              if kw.quality_score is not None and kw.quality_score < 5
+              and kw not in valuable]
+    valuable.extend(low_qs)
+
+    # Sort by cost descending — highest spend keywords are most important
+    valuable.sort(key=lambda kw: kw.cost, reverse=True)
+
+    # Cap at MAX_KEYWORDS_FOR_AI
+    result = valuable[:MAX_KEYWORDS_FOR_AI]
+
+    if len(keywords) != len(result):
+        logger.info(
+            f"Keyword filter: {len(keywords)} → {len(result)} "
+            f"(saved ~{(len(keywords) - len(result)) * 50} prompt tokens)"
+        )
+    return result
+
+
 # ============================================================
 # PRE-ANALYSIS: Compute patterns before sending to AI
 # ============================================================
@@ -294,6 +375,10 @@ def _prepare_campaign_data(
     overview: CampaignOverview,
     keywords: Optional[list[KeywordMetrics]] = None,
     ad_groups: Optional[list[AdGroupMetrics]] = None,
+    trend_data: Optional[TrendReport] = None,
+    hourly_data: Optional[HourlyReport] = None,
+    ad_data: Optional[AdPerformanceReport] = None,
+    negative_keywords: Optional[list[NegativeKeyword]] = None,
 ) -> str:
     """Format campaign data with pre-computed anomalies highlighted."""
 
@@ -426,7 +511,126 @@ def _prepare_campaign_data(
                 f"CPC:{kw.avg_cpc:.2f}€ Kosten:{kw.cost:.2f}€ {conv_str}{flag}"
             )
 
+    # ---- DAILY TRENDS ----
+    if trend_data and trend_data.daily:
+        data_parts.append("\n" + "-" * 40)
+        data_parts.append("📈 TAGESTRENDS")
+        data_parts.append("-" * 40)
+        # Show weekly summary instead of every day to save tokens
+        daily = trend_data.daily
+        week_size = 7
+        for i in range(0, len(daily), week_size):
+            week = daily[i:i + week_size]
+            w_cost = sum(d.cost for d in week)
+            w_clicks = sum(d.clicks for d in week)
+            w_conv = sum(d.conversions for d in week)
+            w_imp = sum(d.impressions for d in week)
+            w_ctr = (w_clicks / w_imp * 100) if w_imp > 0 else 0
+            start_d = week[0].date
+            end_d = week[-1].date
+            data_parts.append(f"  {start_d} – {end_d}: {w_cost:.2f}€ | {w_clicks} Klicks | CTR {w_ctr:.1f}% | {w_conv:.1f} Conv")
+
+        # Trend direction: compare first half vs second half
+        if len(daily) >= 7:
+            mid = len(daily) // 2
+            first_half = daily[:mid]
+            second_half = daily[mid:]
+            f_cost = sum(d.cost for d in first_half) / len(first_half)
+            s_cost = sum(d.cost for d in second_half) / len(second_half)
+            f_conv = sum(d.conversions for d in first_half) / len(first_half)
+            s_conv = sum(d.conversions for d in second_half) / len(second_half)
+            f_ctr = mean([d.ctr for d in first_half if d.impressions > 0]) if any(d.impressions > 0 for d in first_half) else 0
+            s_ctr = mean([d.ctr for d in second_half if d.impressions > 0]) if any(d.impressions > 0 for d in second_half) else 0
+            cost_trend = "↑" if s_cost > f_cost * 1.05 else ("↓" if s_cost < f_cost * 0.95 else "→")
+            conv_trend = "↑" if s_conv > f_conv * 1.05 else ("↓" if s_conv < f_conv * 0.95 else "→")
+            ctr_trend = "↑" if s_ctr > f_ctr * 1.05 else ("↓" if s_ctr < f_ctr * 0.95 else "→")
+            data_parts.append(f"  TREND (1. Hälfte → 2. Hälfte): Kosten {cost_trend} | Conv {conv_trend} | CTR {ctr_trend}")
+
+    # ---- HOURLY PERFORMANCE ----
+    if hourly_data and hourly_data.hours:
+        data_parts.append("\n" + "-" * 40)
+        data_parts.append("🕐 PERFORMANCE NACH TAGESZEIT")
+        data_parts.append("-" * 40)
+        # Group into time blocks to save tokens
+        blocks = [
+            ("Nacht (0-5)", 0, 6),
+            ("Morgen (6-9)", 6, 10),
+            ("Vormittag (10-12)", 10, 13),
+            ("Nachmittag (13-17)", 13, 18),
+            ("Abend (18-21)", 18, 22),
+            ("Spät (22-23)", 22, 24),
+        ]
+        best_block = None
+        best_conv_rate = -1
+        for label, start, end in blocks:
+            block_hours = [h for h in hourly_data.hours if start <= h.hour < end]
+            if not block_hours:
+                continue
+            b_clicks = sum(h.clicks for h in block_hours)
+            b_cost = sum(h.cost for h in block_hours)
+            b_conv = sum(h.conversions for h in block_hours)
+            b_imp = sum(h.impressions for h in block_hours)
+            b_ctr = (b_clicks / b_imp * 100) if b_imp > 0 else 0
+            b_conv_rate = (b_conv / b_clicks * 100) if b_clicks > 0 else 0
+            data_parts.append(f"  {label}: {b_cost:.2f}€ | {b_clicks} Klicks | CTR {b_ctr:.1f}% | {b_conv:.1f} Conv ({b_conv_rate:.1f}% CR)")
+            if b_conv_rate > best_conv_rate and b_clicks > 5:
+                best_conv_rate = b_conv_rate
+                best_block = label
+        if best_block:
+            data_parts.append(f"  🟢 Beste Conversion Rate: {best_block} ({best_conv_rate:.1f}%)")
+
+    # ---- AD COPY PERFORMANCE ----
+    if ad_data and ad_data.ads:
+        data_parts.append("\n" + "-" * 40)
+        data_parts.append(f"📝 ANZEIGEN-PERFORMANCE ({len(ad_data.ads)} Anzeigen)")
+        data_parts.append("-" * 40)
+        for ad in ad_data.ads[:15]:  # Cap at 15 to save tokens
+            headlines_str = " | ".join(ad.headlines[:3]) if ad.headlines else "N/A"
+            conv_str = f"{ad.conversions:.1f} Conv" if ad.conversions > 0 else "0 Conv"
+            flag = " 🔴" if ad.clicks > 10 and ad.conversions == 0 else ""
+            data_parts.append(f"  Ad {ad.ad_id} ({ad.campaign_name} > {ad.ad_group_name})")
+            data_parts.append(f"    Headlines: {headlines_str}")
+            data_parts.append(f"    Imp:{ad.impressions:,} Klicks:{ad.clicks} CTR:{ad.ctr:.1f}% CPC:{ad.avg_cpc:.2f}€ Kosten:{ad.cost:.2f}€ {conv_str}{flag}")
+
+    # ---- NEGATIVE KEYWORDS ----
+    if negative_keywords:
+        data_parts.append("\n" + "-" * 40)
+        data_parts.append(f"🚫 NEGATIVE KEYWORDS ({len(negative_keywords)} aktiv)")
+        data_parts.append("-" * 40)
+        data_parts.append("  (Bereits ausgeschlossen — NICHT erneut vorschlagen!)")
+        # Group by level
+        campaign_negs = [n for n in negative_keywords if n.level == "CAMPAIGN"]
+        adgroup_negs = [n for n in negative_keywords if n.level == "AD_GROUP"]
+        if campaign_negs:
+            data_parts.append(f"\n  Kampagnen-Ebene ({len(campaign_negs)}):")
+            for n in campaign_negs[:50]:
+                data_parts.append(f"    [{n.match_type}] \"{n.keyword_text}\" → {n.campaign_name}")
+        if adgroup_negs:
+            data_parts.append(f"\n  Anzeigengruppen-Ebene ({len(adgroup_negs)}):")
+            for n in adgroup_negs[:50]:
+                data_parts.append(f"    [{n.match_type}] \"{n.keyword_text}\" → {n.campaign_name} > {n.ad_group_name}")
+
     return "\n".join(data_parts)
+
+
+# ============================================================
+# AVAILABLE MODELS
+# ============================================================
+AVAILABLE_MODELS = [
+    {"id": "gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro", "description": "Latest & most capable (preview)"},
+    {"id": "gemini-3-pro-preview", "name": "Gemini 3 Pro", "description": "Very capable (preview)"},
+    {"id": "gemini-3-flash-preview", "name": "Gemini 3 Flash", "description": "Fast next-gen (preview)"},
+    {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "description": "Fast & cost-effective", "default": True},
+    {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "description": "Stable & capable"},
+    {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "description": "Cheapest option"},
+]
+
+DEFAULT_MODEL = "gemini-2.5-flash"
+
+
+def get_available_models() -> list[dict]:
+    """Return list of available Gemini models."""
+    return AVAILABLE_MODELS
 
 
 # ============================================================
@@ -437,15 +641,37 @@ def analyze_campaigns(
     keywords: Optional[list[KeywordMetrics]] = None,
     ad_groups: Optional[list[AdGroupMetrics]] = None,
     focus_areas: Optional[list[str]] = None,
+    trend_data: Optional[TrendReport] = None,
+    hourly_data: Optional[HourlyReport] = None,
+    ad_data: Optional[AdPerformanceReport] = None,
+    model_name: Optional[str] = None,
+    negative_keywords: Optional[list[NegativeKeyword]] = None,
 ) -> AnalysisResponse:
     """
     Send campaign data to Gemini for analysis and get recommendations.
     Uses pre-computed anomalies + expert prompt for precise results.
+    Results are cached based on data hash to avoid redundant API calls.
     """
-    _configure_gemini()
+    # Filter keywords to only valuable ones before any processing
+    filtered_keywords = _filter_keywords_for_ai(keywords) if keywords else None
 
     # Prepare the data with anomaly highlights
-    campaign_data = _prepare_campaign_data(overview, keywords, ad_groups)
+    campaign_data = _prepare_campaign_data(
+        overview, filtered_keywords, ad_groups,
+        trend_data=trend_data,
+        hourly_data=hourly_data,
+        ad_data=ad_data,
+        negative_keywords=negative_keywords,
+    )
+
+    # Check if we have a cached analysis for this exact data
+    data_digest = _data_hash(campaign_data + str(focus_areas or []))
+    cached = cache_get("gemini_analysis", digest=data_digest)
+    if cached:
+        logger.info("Gemini analysis CACHE HIT — saved an API call")
+        return AnalysisResponse.model_validate_json(cached)
+
+    _configure_gemini()
 
     # Build the user prompt with analysis instructions
     user_prompt = f"""Analysiere die folgenden Google Ads Kampagnendaten.
@@ -469,8 +695,9 @@ Die Voranalyse hat bereits Probleme identifiziert — bewerte diese und ergänze
         user_prompt += f"\n\n🎯 PRIORITÄRER FOKUS: {', '.join(focus_descriptions)}"
 
     # Call Gemini with optimized settings
+    selected_model = model_name or DEFAULT_MODEL
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name=selected_model,
         system_instruction=SYSTEM_PROMPT,
         generation_config=genai.GenerationConfig(
             temperature=0.2,       # Low temp = more precise, less creative
@@ -482,6 +709,7 @@ Die Voranalyse hat bereits Probleme identifiziert — bewerte diese und ergänze
     )
 
     response = model.generate_content(user_prompt)
+    _track_token_usage(response, "analysis")
 
     # Parse the response
     try:
@@ -529,13 +757,19 @@ Die Voranalyse hat bereits Probleme identifiziert — bewerte diese und ergänze
         # Sort proposals by priority
         proposals.sort(key=lambda p: priority_order.get(p.priority, 2))
 
-        return AnalysisResponse(
+        analysis = AnalysisResponse(
             summary=result.get("summary", ""),
             recommendations=recs,
             insights=result.get("insights", []),
             raw_data_summary=result.get("raw_data_summary", {}),
             proposals=proposals,
         )
+
+        # Cache for 60 minutes — analysis for the same data won't change
+        cache_set("gemini_analysis", analysis.model_dump_json(), ttl_minutes=60, digest=data_digest)
+        logger.info("Gemini analysis cached (TTL=60min)")
+
+        return analysis
     except json.JSONDecodeError:
         return AnalysisResponse(
             summary=response.text[:500],
@@ -558,40 +792,85 @@ Die Voranalyse hat bereits Probleme identifiziert — bewerte diese und ergänze
 # ============================================================
 # CHAT
 # ============================================================
+def _prepare_compact_summary(
+    overview: CampaignOverview,
+    keywords: Optional[list[KeywordMetrics]] = None,
+    negative_keywords: Optional[list[NegativeKeyword]] = None,
+) -> str:
+    """
+    Create a compact data summary for chat — uses ~60-70% fewer tokens
+    than _prepare_campaign_data while retaining essential context.
+    """
+    parts = []
+    parts.append(f"Zeitraum: {overview.date_range.start_date} – {overview.date_range.end_date}")
+    parts.append(f"Gesamt: {overview.total_cost:.2f}€ | {overview.total_clicks:,} Klicks | "
+                 f"{overview.total_impressions:,} Imp | {overview.total_conversions:.1f} Conv | "
+                 f"CTR {overview.avg_ctr:.2f}% | CPC {overview.avg_cpc:.2f}€")
+    if overview.total_conversions > 0:
+        parts.append(f"CPA: {overview.total_cost / overview.total_conversions:.2f}€")
+
+    parts.append("\nKampagnen:")
+    for c in overview.campaigns:
+        flag = " ⚠️0Conv" if c.cost > 0 and c.conversions == 0 else ""
+        parts.append(f"  {c.campaign_name} ({c.status}): {c.cost:.2f}€, "
+                     f"{c.clicks} Klicks, CTR {c.ctr:.1f}%, "
+                     f"{c.conversions:.1f} Conv, CPA {c.cost_per_conversion:.2f}€{flag}")
+
+    if keywords:
+        # Only top keywords by cost for chat context
+        top_kw = sorted(keywords, key=lambda k: k.cost, reverse=True)[:20]
+        parts.append(f"\nTop {len(top_kw)} Keywords (von {len(keywords)}):")
+        for kw in top_kw:
+            qs = f" QS:{kw.quality_score}" if kw.quality_score else ""
+            parts.append(f"  [{kw.match_type}] \"{kw.keyword_text}\": "
+                         f"{kw.cost:.2f}€, {kw.clicks} Klicks, "
+                         f"{kw.conversions:.1f} Conv{qs}")
+
+    if negative_keywords:
+        parts.append(f"\nNegative Keywords ({len(negative_keywords)} aktiv):")
+        for n in negative_keywords[:30]:
+            parts.append(f"  🚫 [{n.match_type}] \"{n.keyword_text}\" ({n.level})")
+
+    return "\n".join(parts)
+
+
 def chat_about_campaigns(
     overview: CampaignOverview,
     user_question: str,
     keywords: Optional[list[KeywordMetrics]] = None,
+    model_name: Optional[str] = None,
+    negative_keywords: Optional[list[NegativeKeyword]] = None,
 ) -> str:
     """
     Have a conversational exchange about campaign data.
-    Uses pre-computed anomalies for context-aware answers.
+    Uses compact summary to minimize token usage per message.
     """
     _configure_gemini()
 
-    campaign_data = _prepare_campaign_data(overview, keywords)
+    # Use compact summary instead of full data dump — saves ~60% tokens
+    compact_data = _prepare_compact_summary(overview, keywords, negative_keywords)
 
-    chat_prompt = f"""Hier sind die aktuellen Google Ads Kampagnendaten mit Voranalyse:
+    chat_prompt = f"""Aktuelle Google Ads Daten:
 
-{campaign_data}
+{compact_data}
 
 ---
 
-FRAGE DES NUTZERS: {user_question}
+FRAGE: {user_question}
 
-Antworte präzise mit Bezug auf die Daten. Nenne konkrete Zahlen.
-Gib am Ende 1-2 konkrete nächste Schritte als Empfehlung.
-Formatiere mit Aufzählungszeichen für Lesbarkeit."""
+Antworte präzise mit Zahlen. Gib 1-2 nächste Schritte."""
 
+    selected_model = model_name or DEFAULT_MODEL
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name=selected_model,
         system_instruction=CHAT_SYSTEM_PROMPT,
         generation_config=genai.GenerationConfig(
             temperature=0.4,
             top_p=0.9,
-            max_output_tokens=3072,
+            max_output_tokens=2048,  # Reduced from 3072 — chat answers rarely need this much
         ),
     )
 
     response = model.generate_content(chat_prompt)
+    _track_token_usage(response, "chat")
     return response.text

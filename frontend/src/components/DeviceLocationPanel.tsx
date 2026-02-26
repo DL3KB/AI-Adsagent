@@ -27,6 +27,7 @@ import type { DeviceMetrics, LocationMetrics } from "../types";
 interface Props {
   startDate: string;
   endDate: string;
+  campaignId?: string;
 }
 
 const DEVICE_ICONS: Record<string, React.ComponentType<{ size?: number }>> = {
@@ -326,10 +327,10 @@ function LocationTable({ locations }: { locations: LocationMetrics[] }) {
   );
 }
 
-export default function DeviceLocationPanel({ startDate, endDate }: Props) {
+export default function DeviceLocationPanel({ startDate, endDate, campaignId }: Props) {
   const { data, isLoading, error } = useQuery({
-    queryKey: ["segmentation", startDate, endDate],
-    queryFn: () => fetchSegmentation(startDate, endDate),
+    queryKey: ["segmentation", startDate, endDate, campaignId],
+    queryFn: () => fetchSegmentation(startDate, endDate, campaignId),
     retry: 1,
   });
 

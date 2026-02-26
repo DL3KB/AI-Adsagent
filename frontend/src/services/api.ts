@@ -11,12 +11,23 @@ import type {
   ComparisonOverview,
   AuditLogEntry,
   DeviceLocationReport,
+  TrendReport,
+  HourlyReport,
+  AdPerformanceReport,
+  NgramReport,
+  LandingPageReport,
+  GeminiModel,
 } from "../types";
 
 const api = axios.create({
   baseURL: "http://localhost:8000/api",
   headers: { "Content-Type": "application/json" },
 });
+
+export async function fetchModels(): Promise<GeminiModel[]> {
+  const { data } = await api.get<GeminiModel[]>("/models");
+  return data;
+}
 
 export async function fetchCampaigns(
   startDate?: string,
@@ -69,11 +80,15 @@ export async function runAnalysis(
 export async function chatAboutCampaigns(
   question: string,
   startDate?: string,
-  endDate?: string
+  endDate?: string,
+  model?: string,
+  campaignId?: string
 ): Promise<ChatResponse> {
   const params: Record<string, string> = { question };
   if (startDate) params.start_date = startDate;
   if (endDate) params.end_date = endDate;
+  if (model) params.model = model;
+  if (campaignId) params.campaign_id = campaignId;
   const { data } = await api.post<ChatResponse>("/chat", null, { params });
   return data;
 }
@@ -126,6 +141,58 @@ export async function fetchSegmentation(
   if (endDate) params.end_date = endDate;
   if (campaignId) params.campaign_id = campaignId;
   const { data } = await api.get<DeviceLocationReport>("/segmentation", { params });
+  return data;
+}
+
+// ============================================================
+// DAILY TRENDS
+// ============================================================
+
+export async function fetchTrends(
+  startDate?: string,
+  endDate?: string,
+  campaignId?: string
+): Promise<TrendReport> {
+  const params: Record<string, string> = {};
+  if (startDate) params.start_date = startDate;
+  if (endDate) params.end_date = endDate;
+  if (campaignId) params.campaign_id = campaignId;
+  const { data } = await api.get<TrendReport>("/trends", { params });
+  return data;
+}
+
+// ============================================================
+// HOURLY PERFORMANCE
+// ============================================================
+
+export async function fetchHourly(
+  startDate?: string,
+  endDate?: string,
+  campaignId?: string
+): Promise<HourlyReport> {
+  const params: Record<string, string> = {};
+  if (startDate) params.start_date = startDate;
+  if (endDate) params.end_date = endDate;
+  if (campaignId) params.campaign_id = campaignId;
+  const { data } = await api.get<HourlyReport>("/hourly", { params });
+  return data;
+}
+
+// ============================================================
+// AD PERFORMANCE
+// ============================================================
+
+export async function fetchAds(
+  startDate?: string,
+  endDate?: string,
+  campaignId?: string,
+  limit: number = 100
+): Promise<AdPerformanceReport> {
+  const params: Record<string, string | number> = { limit };
+  if (startDate) params.start_date = startDate;
+  if (endDate) params.end_date = endDate;
+  if (campaignId) params.campaign_id = campaignId;
+  const { data } = await api.get<AdPerformanceReport>("/ads", { params });
   return data;
 }
 
@@ -184,4 +251,43 @@ export function getExportUrl(
 
 export async function clearCache(): Promise<void> {
   await api.post("/cache/clear");
+}
+
+// ============================================================
+// N-GRAM ANALYSIS
+// ============================================================
+
+export async function fetchNgrams(
+  startDate?: string,
+  endDate?: string,
+  campaignId?: string,
+  minN: number = 1,
+  maxN: number = 3,
+  minFrequency: number = 2,
+  limit: number = 100
+): Promise<NgramReport> {
+  const params: Record<string, string | number> = { min_n: minN, max_n: maxN, min_frequency: minFrequency, limit };
+  if (startDate) params.start_date = startDate;
+  if (endDate) params.end_date = endDate;
+  if (campaignId) params.campaign_id = campaignId;
+  const { data } = await api.get<NgramReport>("/ngrams", { params });
+  return data;
+}
+
+// ============================================================
+// LANDING PAGE PERFORMANCE
+// ============================================================
+
+export async function fetchLandingPages(
+  startDate?: string,
+  endDate?: string,
+  campaignId?: string,
+  limit: number = 50
+): Promise<LandingPageReport> {
+  const params: Record<string, string | number> = { limit };
+  if (startDate) params.start_date = startDate;
+  if (endDate) params.end_date = endDate;
+  if (campaignId) params.campaign_id = campaignId;
+  const { data } = await api.get<LandingPageReport>("/landing-pages", { params });
+  return data;
 }

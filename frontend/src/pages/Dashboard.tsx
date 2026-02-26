@@ -13,6 +13,12 @@ import AuditLogPanel from "../components/AuditLogPanel";
 import DeviceLocationPanel from "../components/DeviceLocationPanel";
 import ChatPanel from "../components/ChatPanel";
 import DateRangePicker from "../components/DateRangePicker";
+import CampaignSelector from "../components/CampaignSelector";
+import ModelSelector from "../components/ModelSelector";
+import PerformanceDeepDive from "../components/PerformanceDeepDive";
+import NgramAnalysis from "../components/NgramAnalysis";
+import QualityScorePanel from "../components/QualityScorePanel";
+import LandingPagePanel from "../components/LandingPagePanel";
 import type { AnalysisResponse, Proposal } from "../types";
 
 export default function Dashboard() {
@@ -23,9 +29,10 @@ export default function Dashboard() {
   const [startDate, setStartDate] = useState(thirtyDaysAgo.toISOString().split("T")[0]);
   const [endDate, setEndDate] = useState(today.toISOString().split("T")[0]);
   const [selectedCampaignId, setSelectedCampaignId] = useState<string | undefined>();
+  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "analysis" | "chat" | "search-terms" | "segmentation" | "audit-log"
+    "dashboard" | "analysis" | "chat" | "search-terms" | "segmentation" | "deep-dive" | "quality-score" | "landing-pages" | "audit-log"
   >("dashboard");
 
   const queryClient = useQueryClient();
@@ -46,11 +53,39 @@ export default function Dashboard() {
     retry: 1,
   });
 
+  // Derive filtered view when a single campaign is selected
+  const filteredData = campaignData
+    ? selectedCampaignId
+      ? (() => {
+          const filtered = campaignData.campaigns.filter(
+            (c) => c.campaign_id === selectedCampaignId
+          );
+          return {
+            ...campaignData,
+            campaigns: filtered,
+            total_cost: filtered.reduce((s, c) => s + c.cost, 0),
+            total_clicks: filtered.reduce((s, c) => s + c.clicks, 0),
+            total_impressions: filtered.reduce((s, c) => s + c.impressions, 0),
+            total_conversions: filtered.reduce((s, c) => s + c.conversions, 0),
+            avg_ctr:
+              filtered.length > 0
+                ? filtered.reduce((s, c) => s + c.ctr, 0) / filtered.length
+                : 0,
+            avg_cpc:
+              filtered.length > 0
+                ? filtered.reduce((s, c) => s + c.avg_cpc, 0) / filtered.length
+                : 0,
+          };
+        })()
+      : campaignData
+    : undefined;
+
   const analysisMutation = useMutation({
     mutationFn: () =>
       runAnalysis({
         date_range: { start_date: startDate, end_date: endDate },
         campaign_ids: selectedCampaignId ? [selectedCampaignId] : undefined,
+        model: selectedModel,
       }),
     onSuccess: (data) => setAnalysis(data),
   });
@@ -65,6 +100,17 @@ export default function Dashboard() {
           <span className="header-subtitle">Google Ads AI Analysis</span>
         </div>
         <div className="header-right">
+          {campaignData && (
+            <CampaignSelector
+              campaigns={campaignData.campaigns}
+              selectedId={selectedCampaignId}
+              onChange={setSelectedCampaignId}
+            />
+          )}
+          <ModelSelector
+            selectedModel={selectedModel}
+            onChange={setSelectedModel}
+          />
           <DateRangePicker
             startDate={startDate}
             endDate={endDate}
@@ -114,6 +160,24 @@ export default function Dashboard() {
           Devices & Locations
         </button>
         <button
+          className={`tab ${activeTab === "deep-dive" ? "active" : ""}`}
+          onClick={() => setActiveTab("deep-dive")}
+        >
+          Deep Dive
+        </button>
+        <button
+          className={`tab ${activeTab === "quality-score" ? "active" : ""}`}
+          onClick={() => setActiveTab("quality-score")}
+        >
+          Quality Score
+        </button>
+        <button
+          className={`tab ${activeTab === "landing-pages" ? "active" : ""}`}
+          onClick={() => setActiveTab("landing-pages")}
+        >
+          Landing Pages
+        </button>
+        <button
           className={`tab ${activeTab === "analysis" ? "active" : ""}`}
           onClick={() => setActiveTab("analysis")}
         >
@@ -156,13 +220,13 @@ export default function Dashboard() {
           </div>
         )}
 
-        {campaignData && activeTab === "dashboard" && (
+        {filteredData && activeTab === "dashboard" && (
           <>
-            <MetricsCards data={campaignData} />
+            <MetricsCards data={filteredData} />
             <ComparisonCards startDate={startDate} endDate={endDate} />
-            <CampaignCharts campaigns={campaignData.campaigns} />
+            <CampaignCharts campaigns={filteredData.campaigns} />
             <CampaignTable
-              campaigns={campaignData.campaigns}
+              campaigns={filteredData.campaigns}
               onSelect={setSelectedCampaignId}
               selectedId={selectedCampaignId}
             />
@@ -170,11 +234,26 @@ export default function Dashboard() {
         )}
 
         {activeTab === "search-terms" && (
-          <SearchTermsPanel startDate={startDate} endDate={endDate} />
+          <>
+            <SearchTermsPanel startDate={startDate} endDate={endDate} campaignId={selectedCampaignId} />
+            <NgramAnalysis startDate={startDate} endDate={endDate} campaignId={selectedCampaignId} />
+          </>
         )}
 
         {activeTab === "segmentation" && (
-          <DeviceLocationPanel startDate={startDate} endDate={endDate} />
+          <DeviceLocationPanel startDate={startDate} endDate={endDate} campaignId={selectedCampaignId} />
+        )}
+
+        {activeTab === "deep-dive" && (
+          <PerformanceDeepDive startDate={startDate} endDate={endDate} campaignId={selectedCampaignId} />
+        )}
+
+        {activeTab === "quality-score" && (
+          <QualityScorePanel startDate={startDate} endDate={endDate} campaignId={selectedCampaignId} />
+        )}
+
+        {activeTab === "landing-pages" && (
+          <LandingPagePanel startDate={startDate} endDate={endDate} campaignId={selectedCampaignId} />
         )}
 
         {activeTab === "analysis" && (
@@ -198,7 +277,7 @@ export default function Dashboard() {
         )}
 
         {activeTab === "chat" && (
-          <ChatPanel startDate={startDate} endDate={endDate} />
+          <ChatPanel startDate={startDate} endDate={endDate} model={selectedModel} campaignId={selectedCampaignId} />
         )}
 
         {activeTab === "audit-log" && <AuditLogPanel />}

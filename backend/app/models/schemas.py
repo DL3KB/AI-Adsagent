@@ -14,7 +14,7 @@ class CampaignMetrics(BaseModel):
     conversions: float = 0.0
     conversion_value: float = 0.0
     ctr: float = 0.0
-    avg_cpc_micros: int = 0
+    avg_cpc_micros: float = 0
     cost: float = 0.0
     avg_cpc: float = 0.0
     conversion_rate: float = 0.0
@@ -32,7 +32,7 @@ class AdGroupMetrics(BaseModel):
     cost_micros: int = 0
     conversions: float = 0.0
     ctr: float = 0.0
-    avg_cpc_micros: int = 0
+    avg_cpc_micros: float = 0
     cost: float = 0.0
     avg_cpc: float = 0.0
 
@@ -47,14 +47,28 @@ class KeywordMetrics(BaseModel):
     campaign_name: str
     status: str
     quality_score: Optional[int] = None
+    expected_ctr: Optional[str] = None  # ABOVE_AVERAGE, AVERAGE, BELOW_AVERAGE
+    ad_relevance: Optional[str] = None  # ABOVE_AVERAGE, AVERAGE, BELOW_AVERAGE
+    landing_page_experience: Optional[str] = None  # ABOVE_AVERAGE, AVERAGE, BELOW_AVERAGE
     impressions: int = 0
     clicks: int = 0
     cost_micros: int = 0
     conversions: float = 0.0
     ctr: float = 0.0
-    avg_cpc_micros: int = 0
+    avg_cpc_micros: float = 0
     cost: float = 0.0
     avg_cpc: float = 0.0
+
+
+class NegativeKeyword(BaseModel):
+    """A negative keyword at campaign or ad group level."""
+    keyword_text: str
+    match_type: str  # EXACT, PHRASE, BROAD
+    level: str  # CAMPAIGN or AD_GROUP
+    campaign_id: str = ""
+    campaign_name: str = ""
+    ad_group_id: Optional[str] = None
+    ad_group_name: Optional[str] = None
 
 
 class SearchTermMetrics(BaseModel):
@@ -92,6 +106,137 @@ class DateRange(BaseModel):
     end_date: date
 
 
+# ============================================================
+# DAILY TRENDS
+# ============================================================
+
+class DailyMetrics(BaseModel):
+    """Metrics for a single day."""
+    date: date
+    impressions: int = 0
+    clicks: int = 0
+    cost: float = 0.0
+    conversions: float = 0.0
+    ctr: float = 0.0
+    avg_cpc: float = 0.0
+    conversion_rate: float = 0.0
+    cost_per_conversion: float = 0.0
+
+
+class TrendReport(BaseModel):
+    """Day-by-day performance trend data."""
+    daily: list[DailyMetrics]
+    date_range: "DateRange"
+
+
+# ============================================================
+# HOUR-OF-DAY PERFORMANCE
+# ============================================================
+
+class HourlyMetrics(BaseModel):
+    """Performance metrics for a single hour of day."""
+    hour: int  # 0-23
+    impressions: int = 0
+    clicks: int = 0
+    cost: float = 0.0
+    conversions: float = 0.0
+    ctr: float = 0.0
+    avg_cpc: float = 0.0
+    conversion_rate: float = 0.0
+
+
+class HourlyReport(BaseModel):
+    """Hour-of-day performance distribution."""
+    hours: list[HourlyMetrics]
+    date_range: "DateRange"
+
+
+# ============================================================
+# AD COPY PERFORMANCE
+# ============================================================
+
+class AdMetrics(BaseModel):
+    """Performance metrics for a single ad."""
+    ad_id: str
+    ad_group_id: str
+    ad_group_name: str
+    campaign_id: str
+    campaign_name: str
+    status: str
+    ad_type: str = ""
+    headlines: list[str] = []
+    descriptions: list[str] = []
+    final_url: str = ""
+    impressions: int = 0
+    clicks: int = 0
+    cost: float = 0.0
+    conversions: float = 0.0
+    ctr: float = 0.0
+    avg_cpc: float = 0.0
+    conversion_rate: float = 0.0
+    cost_per_conversion: float = 0.0
+
+
+class AdPerformanceReport(BaseModel):
+    """Ad copy performance report."""
+    ads: list[AdMetrics]
+    total_ads: int = 0
+    date_range: "DateRange"
+
+
+# ============================================================
+# N-GRAM ANALYSIS
+# ============================================================
+
+class NgramMetrics(BaseModel):
+    """Aggregated metrics for a single n-gram."""
+    ngram: str
+    n: int  # 1, 2, or 3
+    frequency: int = 0  # how many search terms contain this n-gram
+    impressions: int = 0
+    clicks: int = 0
+    cost: float = 0.0
+    conversions: float = 0.0
+    ctr: float = 0.0
+    avg_cpc: float = 0.0
+    conversion_rate: float = 0.0
+    cost_per_conversion: float = 0.0
+    search_terms: list[str] = []  # sample search terms containing this n-gram
+
+
+class NgramReport(BaseModel):
+    """N-gram analysis report."""
+    ngrams: list[NgramMetrics]
+    total_ngrams: int = 0
+    date_range: "DateRange"
+
+
+# ============================================================
+# LANDING PAGE PERFORMANCE
+# ============================================================
+
+class LandingPageMetrics(BaseModel):
+    """Performance metrics for a single landing page URL."""
+    url: str
+    impressions: int = 0
+    clicks: int = 0
+    cost: float = 0.0
+    conversions: float = 0.0
+    ctr: float = 0.0
+    avg_cpc: float = 0.0
+    conversion_rate: float = 0.0
+    cost_per_conversion: float = 0.0
+    mobile_friendly: Optional[bool] = None
+    speed_score: Optional[float] = None
+
+
+class LandingPageReport(BaseModel):
+    """Landing page performance report."""
+    pages: list[LandingPageMetrics]
+    total_pages: int = 0
+    date_range: "DateRange"
+
+
 class CampaignOverview(BaseModel):
     campaigns: list[CampaignMetrics]
     total_cost: float
@@ -107,6 +252,7 @@ class AnalysisRequest(BaseModel):
     campaign_ids: Optional[list[str]] = None
     date_range: Optional[DateRange] = None
     focus_areas: Optional[list[str]] = None  # z.B. ["ctr", "quality_score", "budget"]
+    model: Optional[str] = None  # e.g. "gemini-2.5-flash", "gemini-2.5-pro"
 
 
 class AnalysisResponse(BaseModel):
@@ -291,3 +437,5 @@ class ApplyProposalsResponse(BaseModel):
 AnalysisResponse.model_rebuild()
 SearchTermReport.model_rebuild()
 DeviceLocationReport.model_rebuild()
+NgramReport.model_rebuild()
+LandingPageReport.model_rebuild()

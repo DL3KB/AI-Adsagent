@@ -57,6 +57,9 @@ export interface KeywordMetrics {
   campaign_name: string;
   status: string;
   quality_score: number | null;
+  expected_ctr: string | null;
+  ad_relevance: string | null;
+  landing_page_experience: string | null;
   impressions: number;
   clicks: number;
   cost_micros: number;
@@ -147,10 +150,18 @@ export interface AnalysisRequest {
   campaign_ids?: string[];
   date_range?: DateRange;
   focus_areas?: string[];
+  model?: string;
 }
 
 export interface ChatResponse {
   answer: string;
+}
+
+export interface GeminiModel {
+  id: string;
+  name: string;
+  description: string;
+  default?: boolean;
 }
 
 // ============================================================
@@ -224,6 +235,78 @@ export interface DeviceLocationReport {
 }
 
 // ============================================================
+// DAILY TRENDS
+// ============================================================
+
+export interface DailyMetrics {
+  date: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  conversions: number;
+  ctr: number;
+  avg_cpc: number;
+  conversion_rate: number;
+  cost_per_conversion: number;
+}
+
+export interface TrendReport {
+  daily: DailyMetrics[];
+  date_range: DateRange;
+}
+
+// ============================================================
+// HOURLY PERFORMANCE
+// ============================================================
+
+export interface HourlyMetrics {
+  hour: number;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  conversions: number;
+  ctr: number;
+  avg_cpc: number;
+  conversion_rate: number;
+}
+
+export interface HourlyReport {
+  hours: HourlyMetrics[];
+  date_range: DateRange;
+}
+
+// ============================================================
+// AD COPY PERFORMANCE
+// ============================================================
+
+export interface AdMetrics {
+  ad_id: string;
+  ad_group_id: string;
+  ad_group_name: string;
+  campaign_id: string;
+  campaign_name: string;
+  status: string;
+  ad_type: string;
+  headlines: string[];
+  descriptions: string[];
+  final_url: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  conversions: number;
+  ctr: number;
+  avg_cpc: number;
+  conversion_rate: number;
+  cost_per_conversion: number;
+}
+
+export interface AdPerformanceReport {
+  ads: AdMetrics[];
+  total_ads: number;
+  date_range: DateRange;
+}
+
+// ============================================================
 // PERIOD COMPARISON
 // ============================================================
 
@@ -266,4 +349,53 @@ export interface AuditLogEntry {
   new_value?: string;
   success: boolean;
   error_message?: string;
+}
+
+// ============================================================
+// N-GRAM ANALYSIS
+// ============================================================
+
+export interface NgramMetrics {
+  ngram: string;
+  n: number;
+  frequency: number;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  conversions: number;
+  ctr: number;
+  avg_cpc: number;
+  conversion_rate: number;
+  cost_per_conversion: number;
+  search_terms: string[];
+}
+
+export interface NgramReport {
+  ngrams: NgramMetrics[];
+  total_ngrams: number;
+  date_range: DateRange;
+}
+
+// ============================================================
+// LANDING PAGE PERFORMANCE
+// ============================================================
+
+export interface LandingPageMetrics {
+  url: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  conversions: number;
+  ctr: number;
+  avg_cpc: number;
+  conversion_rate: number;
+  cost_per_conversion: number;
+  mobile_friendly?: boolean;
+  speed_score?: number;
+}
+
+export interface LandingPageReport {
+  pages: LandingPageMetrics[];
+  total_pages: number;
+  date_range: DateRange;
 }

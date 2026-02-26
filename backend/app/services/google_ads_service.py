@@ -23,7 +23,18 @@ from app.models.schemas import (
     DeviceMetrics,
     LocationMetrics,
     DeviceLocationReport,
+    DailyMetrics,
+    TrendReport,
+    HourlyMetrics,
+    HourlyReport,
+    AdMetrics,
+    AdPerformanceReport,
+    NgramMetrics,
+    NgramReport,
+    LandingPageMetrics,
+    LandingPageReport,
 )
+from collections import defaultdict
 from app.services.cache_service import cache_get, cache_set
 
 logger = logging.getLogger(__name__)
@@ -294,6 +305,9 @@ def get_keywords(
             ad_group_criterion.keyword.text,
             ad_group_criterion.keyword.match_type,
             ad_group_criterion.quality_info.quality_score,
+            ad_group_criterion.quality_info.creative_quality_score,
+            ad_group_criterion.quality_info.post_click_quality_score,
+            ad_group_criterion.quality_info.search_predicted_ctr,
             ad_group_criterion.status,
             ad_group.id,
             ad_group.name,
@@ -328,6 +342,12 @@ def get_keywords(
             qs = row.ad_group_criterion.quality_info.quality_score
             quality_score = qs if qs > 0 else None
 
+            # Quality Score sub-components (enum → readable string)
+            qi = row.ad_group_criterion.quality_info
+            expected_ctr = qi.search_predicted_ctr.name if qi.search_predicted_ctr and qi.search_predicted_ctr.name != "UNSPECIFIED" else None
+            ad_relevance = qi.creative_quality_score.name if qi.creative_quality_score and qi.creative_quality_score.name != "UNSPECIFIED" else None
+            landing_page_exp = qi.post_click_quality_score.name if qi.post_click_quality_score and qi.post_click_quality_score.name != "UNSPECIFIED" else None
+
             keyword = KeywordMetrics(
                 keyword_id=str(row.ad_group_criterion.criterion_id),
                 keyword_text=row.ad_group_criterion.keyword.text,
@@ -338,6 +358,9 @@ def get_keywords(
                 campaign_name=row.campaign.name,
                 status=row.ad_group_criterion.status.name,
                 quality_score=quality_score,
+                expected_ctr=expected_ctr,
+                ad_relevance=ad_relevance,
+                landing_page_experience=landing_page_exp,
                 impressions=row.metrics.impressions,
                 clicks=row.metrics.clicks,
                 cost_micros=row.metrics.cost_micros,
@@ -356,6 +379,92 @@ def get_keywords(
     except GoogleAdsException as ex:
         error_messages = [error.message for error in ex.failure.errors]
         raise Exception(f"Google Ads API Error: {'; '.join(error_messages)}")
+
+
+def get_negative_keywords(
+    campaign_id: Optional[str] = None,
+) -> list:
+    """Fetch negative keywords at campaign level (cached 15 min)."""
+    from app.models.schemas import NegativeKeyword
+
+    cache_params = dict(campaign=campaign_id)
+    cached = cache_get("negative_keywords", **cache_params)
+    if cached:
+        raw = json.loads(cached)
+        return [NegativeKeyword.model_validate(k) for k in raw]
+
+    settings = get_settings()
+    client = _get_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    negatives: list[NegativeKeyword] = []
+
+    # ---- Campaign-level negative keywords ----
+    query = """
+        SELECT
+            campaign_criterion.keyword.text,
+            campaign_criterion.keyword.match_type,
+            campaign_criterion.negative,
+            campaign.id,
+            campaign.name
+        FROM campaign_criterion
+        WHERE campaign_criterion.type = 'KEYWORD'
+          AND campaign_criterion.negative = TRUE
+    """
+    if campaign_id:
+        query += f" AND campaign.id = {campaign_id}"
+
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=query
+        )
+        for row in response:
+            negatives.append(NegativeKeyword(
+                keyword_text=row.campaign_criterion.keyword.text,
+                match_type=row.campaign_criterion.keyword.match_type.name,
+                level="CAMPAIGN",
+                campaign_id=str(row.campaign.id),
+                campaign_name=row.campaign.name,
+            ))
+    except GoogleAdsException as ex:
+        logger.warning(f"Failed to fetch campaign negatives: {ex}")
+
+    # ---- Ad group-level negative keywords ----
+    ag_query = """
+        SELECT
+            ad_group_criterion.keyword.text,
+            ad_group_criterion.keyword.match_type,
+            ad_group_criterion.negative,
+            ad_group.id,
+            ad_group.name,
+            campaign.id,
+            campaign.name
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.negative = TRUE
+    """
+    if campaign_id:
+        ag_query += f" AND campaign.id = {campaign_id}"
+
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=ag_query
+        )
+        for row in response:
+            negatives.append(NegativeKeyword(
+                keyword_text=row.ad_group_criterion.keyword.text,
+                match_type=row.ad_group_criterion.keyword.match_type.name,
+                level="AD_GROUP",
+                campaign_id=str(row.campaign.id),
+                campaign_name=row.campaign.name,
+                ad_group_id=str(row.ad_group.id),
+                ad_group_name=row.ad_group.name,
+            ))
+    except GoogleAdsException as ex:
+        logger.warning(f"Failed to fetch ad group negatives: {ex}")
+
+    cache_set("negative_keywords", json.dumps([n.model_dump() for n in negatives], default=str), **cache_params)
+    return negatives
 
 
 def get_search_terms(
@@ -611,8 +720,9 @@ def get_location_performance(
 
     query = f"""
         SELECT
-            campaign_criterion.location.geo_target_constant,
             geographic_view.country_criterion_id,
+            geographic_view.location_type,
+            campaign.id,
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
@@ -635,43 +745,43 @@ def get_location_performance(
             customer_id=settings.google_ads_customer_id, query=query
         )
 
-        # We also need geo target constant names — fetch them separately
-        geo_ids: set[str] = set()
+        # Collect rows and geo IDs for name lookup
+        geo_ids: set[int] = set()
         raw_rows = []
         for row in response:
             raw_rows.append(row)
-            geo_resource = row.campaign_criterion.location.geo_target_constant
-            if geo_resource:
-                geo_ids.add(geo_resource)
+            geo_id = row.geographic_view.country_criterion_id
+            if geo_id:
+                geo_ids.add(geo_id)
 
         # Fetch geo target names
-        geo_names: dict[str, tuple[str, str]] = {}  # resource -> (name, type)
+        geo_names: dict[int, tuple[str, str]] = {}  # criterion_id -> (name, type)
         if geo_ids:
-            for geo_resource in geo_ids:
-                try:
-                    geo_query = f"""
-                        SELECT
-                            geo_target_constant.name,
-                            geo_target_constant.target_type,
-                            geo_target_constant.resource_name
-                        FROM geo_target_constant
-                        WHERE geo_target_constant.resource_name = '{geo_resource}'
-                    """
-                    geo_resp = ga_service.search(
-                        customer_id=settings.google_ads_customer_id, query=geo_query
+            ids_list = ", ".join(str(gid) for gid in geo_ids)
+            try:
+                geo_query = f"""
+                    SELECT
+                        geo_target_constant.name,
+                        geo_target_constant.target_type,
+                        geo_target_constant.id
+                    FROM geo_target_constant
+                    WHERE geo_target_constant.id IN ({ids_list})
+                """
+                geo_resp = ga_service.search(
+                    customer_id=settings.google_ads_customer_id, query=geo_query
+                )
+                for gr in geo_resp:
+                    geo_names[gr.geo_target_constant.id] = (
+                        gr.geo_target_constant.name,
+                        gr.geo_target_constant.target_type,
                     )
-                    for gr in geo_resp:
-                        geo_names[geo_resource] = (
-                            gr.geo_target_constant.name,
-                            gr.geo_target_constant.target_type,
-                        )
-                except Exception:
-                    geo_names[geo_resource] = (geo_resource.split("/")[-1], "Unknown")
+            except Exception:
+                pass
 
         locations = []
         for row in raw_rows:
-            geo_resource = row.campaign_criterion.location.geo_target_constant
-            name, loc_type = geo_names.get(geo_resource, (geo_resource.split("/")[-1] if geo_resource else "Unknown", ""))
+            geo_id = row.geographic_view.country_criterion_id
+            name, loc_type = geo_names.get(geo_id, (str(geo_id), "Unknown"))
 
             cost = _micros_to_currency(row.metrics.cost_micros)
             clicks = row.metrics.clicks
@@ -685,7 +795,7 @@ def get_location_performance(
             locations.append(LocationMetrics(
                 location_name=name,
                 location_type=loc_type,
-                location_id=geo_resource.split("/")[-1] if geo_resource else "",
+                location_id=str(geo_id),
                 impressions=impressions,
                 clicks=clicks,
                 cost=round(cost, 2),
@@ -719,3 +829,502 @@ def get_device_location_report(
         locations=locations,
         date_range=date_range,
     )
+
+
+# ============================================================
+# DAILY TRENDS
+# ============================================================
+
+def get_daily_trends(
+    date_range: Optional[DateRange] = None,
+    campaign_id: Optional[str] = None,
+) -> TrendReport:
+    """Fetch day-by-day performance metrics (cached 15 min)."""
+    if date_range is None:
+        date_range = _default_date_range()
+
+    cache_params = dict(
+        start=str(date_range.start_date),
+        end=str(date_range.end_date),
+        campaign=campaign_id,
+    )
+    cached = cache_get("daily_trends", **cache_params)
+    if cached:
+        return TrendReport.model_validate_json(cached)
+
+    settings = get_settings()
+    client = _get_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    start_str = date_range.start_date.strftime("%Y-%m-%d")
+    end_str = date_range.end_date.strftime("%Y-%m-%d")
+
+    query = f"""
+        SELECT
+            segments.date,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.ctr,
+            metrics.average_cpc
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_str}' AND '{end_str}'
+            AND campaign.advertising_channel_type = 'SEARCH'
+    """
+
+    if campaign_id:
+        query += f" AND campaign.id = {campaign_id}"
+
+    query += " ORDER BY segments.date ASC"
+
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=query
+        )
+
+        # Aggregate by date (multiple campaigns per day)
+        day_data: dict[str, dict] = {}
+        for row in response:
+            d = row.segments.date  # YYYY-MM-DD string
+            if d not in day_data:
+                day_data[d] = {"impressions": 0, "clicks": 0, "cost_micros": 0, "conversions": 0.0}
+            day_data[d]["impressions"] += row.metrics.impressions
+            day_data[d]["clicks"] += row.metrics.clicks
+            day_data[d]["cost_micros"] += row.metrics.cost_micros
+            day_data[d]["conversions"] += row.metrics.conversions
+
+        daily = []
+        for d in sorted(day_data.keys()):
+            dd = day_data[d]
+            cost = _micros_to_currency(dd["cost_micros"])
+            clicks = dd["clicks"]
+            impressions = dd["impressions"]
+            conversions = dd["conversions"]
+            ctr = (clicks / impressions * 100) if impressions > 0 else 0.0
+            avg_cpc = (cost / clicks) if clicks > 0 else 0.0
+            conv_rate = (conversions / clicks * 100) if clicks > 0 else 0.0
+            cost_per_conv = (cost / conversions) if conversions > 0 else 0.0
+
+            daily.append(DailyMetrics(
+                date=date.fromisoformat(d),
+                impressions=impressions,
+                clicks=clicks,
+                cost=round(cost, 2),
+                conversions=round(conversions, 2),
+                ctr=round(ctr, 2),
+                avg_cpc=round(avg_cpc, 2),
+                conversion_rate=round(conv_rate, 2),
+                cost_per_conversion=round(cost_per_conv, 2),
+            ))
+
+        result = TrendReport(daily=daily, date_range=date_range)
+        cache_set("daily_trends", result.model_dump_json(), **cache_params)
+        return result
+
+    except GoogleAdsException as ex:
+        error_messages = [error.message for error in ex.failure.errors]
+        raise Exception(f"Google Ads API Error: {'; '.join(error_messages)}")
+
+
+# ============================================================
+# HOUR-OF-DAY PERFORMANCE
+# ============================================================
+
+def get_hourly_performance(
+    date_range: Optional[DateRange] = None,
+    campaign_id: Optional[str] = None,
+) -> HourlyReport:
+    """Fetch performance by hour of day (cached 15 min)."""
+    if date_range is None:
+        date_range = _default_date_range()
+
+    cache_params = dict(
+        start=str(date_range.start_date),
+        end=str(date_range.end_date),
+        campaign=campaign_id,
+    )
+    cached = cache_get("hourly_perf", **cache_params)
+    if cached:
+        return HourlyReport.model_validate_json(cached)
+
+    settings = get_settings()
+    client = _get_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    start_str = date_range.start_date.strftime("%Y-%m-%d")
+    end_str = date_range.end_date.strftime("%Y-%m-%d")
+
+    query = f"""
+        SELECT
+            segments.hour,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_str}' AND '{end_str}'
+            AND campaign.advertising_channel_type = 'SEARCH'
+    """
+
+    if campaign_id:
+        query += f" AND campaign.id = {campaign_id}"
+
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=query
+        )
+
+        hour_data: dict[int, dict] = {}
+        for row in response:
+            h = row.segments.hour
+            if h not in hour_data:
+                hour_data[h] = {"impressions": 0, "clicks": 0, "cost_micros": 0, "conversions": 0.0}
+            hour_data[h]["impressions"] += row.metrics.impressions
+            hour_data[h]["clicks"] += row.metrics.clicks
+            hour_data[h]["cost_micros"] += row.metrics.cost_micros
+            hour_data[h]["conversions"] += row.metrics.conversions
+
+        hours = []
+        for h in range(24):
+            hd = hour_data.get(h, {"impressions": 0, "clicks": 0, "cost_micros": 0, "conversions": 0.0})
+            cost = _micros_to_currency(hd["cost_micros"])
+            clicks = hd["clicks"]
+            impressions = hd["impressions"]
+            conversions = hd["conversions"]
+            ctr = (clicks / impressions * 100) if impressions > 0 else 0.0
+            avg_cpc = (cost / clicks) if clicks > 0 else 0.0
+            conv_rate = (conversions / clicks * 100) if clicks > 0 else 0.0
+
+            hours.append(HourlyMetrics(
+                hour=h,
+                impressions=impressions,
+                clicks=clicks,
+                cost=round(cost, 2),
+                conversions=round(conversions, 2),
+                ctr=round(ctr, 2),
+                avg_cpc=round(avg_cpc, 2),
+                conversion_rate=round(conv_rate, 2),
+            ))
+
+        result = HourlyReport(hours=hours, date_range=date_range)
+        cache_set("hourly_perf", result.model_dump_json(), **cache_params)
+        return result
+
+    except GoogleAdsException as ex:
+        error_messages = [error.message for error in ex.failure.errors]
+        raise Exception(f"Google Ads API Error: {'; '.join(error_messages)}")
+
+
+# ============================================================
+# AD COPY PERFORMANCE
+# ============================================================
+
+def get_ad_performance(
+    date_range: Optional[DateRange] = None,
+    campaign_id: Optional[str] = None,
+    limit: int = 100,
+) -> AdPerformanceReport:
+    """Fetch ad-level performance metrics including headlines & descriptions (cached 15 min)."""
+    if date_range is None:
+        date_range = _default_date_range()
+
+    cache_params = dict(
+        start=str(date_range.start_date),
+        end=str(date_range.end_date),
+        campaign=campaign_id,
+        limit=limit,
+    )
+    cached = cache_get("ad_perf", **cache_params)
+    if cached:
+        return AdPerformanceReport.model_validate_json(cached)
+
+    settings = get_settings()
+    client = _get_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    start_str = date_range.start_date.strftime("%Y-%m-%d")
+    end_str = date_range.end_date.strftime("%Y-%m-%d")
+
+    query = f"""
+        SELECT
+            ad_group_ad.ad.id,
+            ad_group_ad.ad.type,
+            ad_group_ad.ad.responsive_search_ad.headlines,
+            ad_group_ad.ad.responsive_search_ad.descriptions,
+            ad_group_ad.ad.final_urls,
+            ad_group_ad.status,
+            ad_group.id,
+            ad_group.name,
+            campaign.id,
+            campaign.name,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.ctr,
+            metrics.average_cpc
+        FROM ad_group_ad
+        WHERE segments.date BETWEEN '{start_str}' AND '{end_str}'
+            AND campaign.advertising_channel_type = 'SEARCH'
+            AND ad_group_ad.status != 'REMOVED'
+    """
+
+    if campaign_id:
+        query += f" AND campaign.id = {campaign_id}"
+
+    query += f" ORDER BY metrics.cost_micros DESC LIMIT {limit}"
+
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=query
+        )
+
+        ads = []
+        for row in response:
+            cost = _micros_to_currency(row.metrics.cost_micros)
+            avg_cpc = _micros_to_currency(row.metrics.average_cpc)
+            clicks = row.metrics.clicks
+            conversions = row.metrics.conversions
+            conv_rate = (conversions / clicks * 100) if clicks > 0 else 0.0
+            cost_per_conv = (cost / conversions) if conversions > 0 else 0.0
+
+            # Extract headlines and descriptions from responsive search ads
+            headlines = []
+            descriptions = []
+            try:
+                rsa = row.ad_group_ad.ad.responsive_search_ad
+                if rsa.headlines:
+                    headlines = [h.text for h in rsa.headlines]
+                if rsa.descriptions:
+                    descriptions = [d.text for d in rsa.descriptions]
+            except Exception:
+                pass
+
+            final_urls = list(row.ad_group_ad.ad.final_urls) if row.ad_group_ad.ad.final_urls else []
+            final_url = final_urls[0] if final_urls else ""
+
+            ads.append(AdMetrics(
+                ad_id=str(row.ad_group_ad.ad.id),
+                ad_group_id=str(row.ad_group.id),
+                ad_group_name=row.ad_group.name,
+                campaign_id=str(row.campaign.id),
+                campaign_name=row.campaign.name,
+                status=row.ad_group_ad.status.name,
+                ad_type=row.ad_group_ad.ad.type_.name if hasattr(row.ad_group_ad.ad, 'type_') else str(row.ad_group_ad.ad.type),
+                headlines=headlines,
+                descriptions=descriptions,
+                final_url=final_url,
+                impressions=row.metrics.impressions,
+                clicks=clicks,
+                cost=round(cost, 2),
+                conversions=round(conversions, 2),
+                ctr=round(row.metrics.ctr * 100, 2),
+                avg_cpc=round(avg_cpc, 2),
+                conversion_rate=round(conv_rate, 2),
+                cost_per_conversion=round(cost_per_conv, 2),
+            ))
+
+        result = AdPerformanceReport(
+            ads=ads,
+            total_ads=len(ads),
+            date_range=date_range,
+        )
+        cache_set("ad_perf", result.model_dump_json(), **cache_params)
+        return result
+
+    except GoogleAdsException as ex:
+        error_messages = [error.message for error in ex.failure.errors]
+        raise Exception(f"Google Ads API Error: {'; '.join(error_messages)}")
+
+
+# ============================================================
+# N-GRAM ANALYSIS (computed from search term data)
+# ============================================================
+
+def _extract_ngrams(text: str, n: int) -> list[str]:
+    """Extract n-grams from a search term."""
+    words = text.lower().strip().split()
+    if len(words) < n:
+        return []
+    return [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
+
+
+def get_ngram_analysis(
+    campaign_id: Optional[str] = None,
+    date_range: Optional[DateRange] = None,
+    min_n: int = 1,
+    max_n: int = 3,
+    min_frequency: int = 2,
+    limit: int = 100,
+) -> NgramReport:
+    """Analyze search terms by breaking them into n-grams with aggregated metrics."""
+    if date_range is None:
+        date_range = _default_date_range()
+
+    # Check cache
+    cache_params = dict(
+        start=str(date_range.start_date),
+        end=str(date_range.end_date),
+        campaign=campaign_id,
+        min_n=min_n,
+        max_n=max_n,
+        min_freq=min_frequency,
+    )
+    cached = cache_get("ngrams", **cache_params)
+    if cached:
+        return NgramReport.model_validate_json(cached)
+
+    # Fetch search terms (reuse existing function)
+    search_report = get_search_terms(
+        campaign_id=campaign_id,
+        date_range=date_range,
+        limit=500,  # get more search terms for better n-gram analysis
+    )
+
+    # Aggregate n-grams
+    ngram_data: dict[str, dict] = defaultdict(lambda: {
+        "impressions": 0, "clicks": 0, "cost": 0.0,
+        "conversions": 0.0, "search_terms": set(), "n": 0,
+    })
+
+    for st in search_report.search_terms:
+        for n in range(min_n, max_n + 1):
+            for ngram in _extract_ngrams(st.search_term, n):
+                entry = ngram_data[ngram]
+                entry["n"] = n
+                entry["impressions"] += st.impressions
+                entry["clicks"] += st.clicks
+                entry["cost"] += st.cost
+                entry["conversions"] += st.conversions
+                entry["search_terms"].add(st.search_term)
+
+    # Build results, filter by min_frequency
+    ngrams = []
+    for ngram_text, data in ngram_data.items():
+        freq = len(data["search_terms"])
+        if freq < min_frequency:
+            continue
+
+        clicks = data["clicks"]
+        impressions = data["impressions"]
+        cost = data["cost"]
+        conversions = data["conversions"]
+        ctr = (clicks / impressions * 100) if impressions > 0 else 0.0
+        avg_cpc = (cost / clicks) if clicks > 0 else 0.0
+        conv_rate = (conversions / clicks * 100) if clicks > 0 else 0.0
+        cost_per_conv = (cost / conversions) if conversions > 0 else 0.0
+
+        ngrams.append(NgramMetrics(
+            ngram=ngram_text,
+            n=data["n"],
+            frequency=freq,
+            impressions=impressions,
+            clicks=clicks,
+            cost=round(cost, 2),
+            conversions=round(conversions, 2),
+            ctr=round(ctr, 2),
+            avg_cpc=round(avg_cpc, 2),
+            conversion_rate=round(conv_rate, 2),
+            cost_per_conversion=round(cost_per_conv, 2),
+            search_terms=sorted(list(data["search_terms"]))[:5],  # top 5 examples
+        ))
+
+    # Sort by cost descending and limit
+    ngrams.sort(key=lambda x: x.cost, reverse=True)
+    ngrams = ngrams[:limit]
+
+    result = NgramReport(
+        ngrams=ngrams,
+        total_ngrams=len(ngrams),
+        date_range=date_range,
+    )
+    cache_set("ngrams", result.model_dump_json(), **cache_params)
+    return result
+
+
+# ============================================================
+# LANDING PAGE PERFORMANCE
+# ============================================================
+
+def get_landing_page_performance(
+    campaign_id: Optional[str] = None,
+    date_range: Optional[DateRange] = None,
+    limit: int = 50,
+) -> LandingPageReport:
+    """Fetch landing page performance metrics (cached 15 min)."""
+    if date_range is None:
+        date_range = _default_date_range()
+
+    cache_params = dict(
+        start=str(date_range.start_date),
+        end=str(date_range.end_date),
+        campaign=campaign_id,
+        limit=limit,
+    )
+    cached = cache_get("landing_pages", **cache_params)
+    if cached:
+        return LandingPageReport.model_validate_json(cached)
+
+    settings = get_settings()
+    client = _get_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    start_str = date_range.start_date.strftime("%Y-%m-%d")
+    end_str = date_range.end_date.strftime("%Y-%m-%d")
+
+    query = f"""
+        SELECT
+            landing_page_view.unexpanded_final_url,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.ctr,
+            metrics.average_cpc
+        FROM landing_page_view
+        WHERE segments.date BETWEEN '{start_str}' AND '{end_str}'
+    """
+
+    if campaign_id:
+        query += f" AND campaign.id = {campaign_id}"
+
+    query += f" ORDER BY metrics.cost_micros DESC LIMIT {limit}"
+
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=query
+        )
+
+        pages = []
+        for row in response:
+            cost = _micros_to_currency(row.metrics.cost_micros)
+            avg_cpc = _micros_to_currency(row.metrics.average_cpc)
+            clicks = row.metrics.clicks
+            conversions = row.metrics.conversions
+            conv_rate = (conversions / clicks * 100) if clicks > 0 else 0.0
+            cost_per_conv = (cost / conversions) if conversions > 0 else 0.0
+
+            pages.append(LandingPageMetrics(
+                url=row.landing_page_view.unexpanded_final_url,
+                impressions=row.metrics.impressions,
+                clicks=clicks,
+                cost=round(cost, 2),
+                conversions=round(conversions, 2),
+                ctr=round(row.metrics.ctr * 100, 2),
+                avg_cpc=round(avg_cpc, 2),
+                conversion_rate=round(conv_rate, 2),
+                cost_per_conversion=round(cost_per_conv, 2),
+            ))
+
+        result = LandingPageReport(
+            pages=pages,
+            total_pages=len(pages),
+            date_range=date_range,
+        )
+        cache_set("landing_pages", result.model_dump_json(), **cache_params)
+        return result
+
+    except GoogleAdsException as ex:
+        error_messages = [error.message for error in ex.failure.errors]
+        raise Exception(f"Google Ads API Error: {'; '.join(error_messages)}")

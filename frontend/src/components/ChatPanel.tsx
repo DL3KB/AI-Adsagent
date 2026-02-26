@@ -10,9 +10,11 @@ interface Message {
 interface Props {
   startDate?: string;
   endDate?: string;
+  model?: string;
+  campaignId?: string;
 }
 
-export default function ChatPanel({ startDate, endDate }: Props) {
+export default function ChatPanel({ startDate, endDate, model, campaignId }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -31,7 +33,7 @@ export default function ChatPanel({ startDate, endDate }: Props) {
     setIsLoading(true);
 
     try {
-      const response = await chatAboutCampaigns(question, startDate, endDate);
+      const response = await chatAboutCampaigns(question, startDate, endDate, model, campaignId);
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: response.answer },
