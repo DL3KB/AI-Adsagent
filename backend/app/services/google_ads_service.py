@@ -467,6 +467,78 @@ def get_negative_keywords(
     return negatives
 
 
+def get_change_history(
+    campaign_id: Optional[str] = None,
+    date_range: Optional[DateRange] = None,
+    limit: int = 50,
+) -> list:
+    """Fetch account change history (change_event) for the given period (cached 15 min)."""
+    from app.models.schemas import ChangeEvent
+
+    if date_range is None:
+        date_range = _default_date_range()
+
+    # change_event only supports up to 30 days back
+    earliest = date.today() - timedelta(days=29)
+    start = max(date_range.start_date, earliest)
+    end = min(date_range.end_date, date.today())
+
+    cache_params = dict(start=str(start), end=str(end), campaign=campaign_id)
+    cached = cache_get("change_history", **cache_params)
+    if cached:
+        raw = json.loads(cached)
+        return [ChangeEvent.model_validate(e) for e in raw]
+
+    settings = get_settings()
+    client = _get_client()
+    ga_service = client.get_service("GoogleAdsService")
+
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    query = f"""
+        SELECT
+            change_event.change_date_time,
+            change_event.change_resource_type,
+            change_event.changed_fields,
+            change_event.resource_change_operation,
+            change_event.user_email,
+            campaign.name,
+            campaign.id
+        FROM change_event
+        WHERE change_event.change_date_time >= '{start_str}'
+          AND change_event.change_date_time <= '{end_str}'
+    """
+    if campaign_id:
+        query += f" AND campaign.id = {campaign_id}"
+    query += f" ORDER BY change_event.change_date_time DESC LIMIT {limit}"
+
+    events: list[ChangeEvent] = []
+    try:
+        response = ga_service.search(
+            customer_id=settings.google_ads_customer_id, query=query
+        )
+        for row in response:
+            ce = row.change_event
+            fields = list(ce.changed_fields.paths) if ce.changed_fields else []
+            events.append(ChangeEvent(
+                change_date_time=ce.change_date_time,
+                resource_type=ce.change_resource_type.name,
+                operation=ce.resource_change_operation.name,
+                changed_fields=fields,
+                user_email=ce.user_email,
+                campaign_id=str(row.campaign.id),
+                campaign_name=row.campaign.name,
+            ))
+    except GoogleAdsException as ex:
+        logger.warning(f"Failed to fetch change history: {ex}")
+    except Exception as ex:
+        logger.warning(f"Change history error: {ex}")
+
+    cache_set("change_history", json.dumps([e.model_dump() for e in events], default=str), **cache_params)
+    return events
+
+
 def get_search_terms(
     campaign_id: Optional[str] = None,
     date_range: Optional[DateRange] = None,

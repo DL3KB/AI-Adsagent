@@ -32,6 +32,7 @@ from app.models.schemas import (
     HourlyReport,
     AdPerformanceReport,
     NegativeKeyword,
+    ChangeEvent,
 )
 from app.services.cache_service import cache_get, cache_set
 
@@ -379,6 +380,7 @@ def _prepare_campaign_data(
     hourly_data: Optional[HourlyReport] = None,
     ad_data: Optional[AdPerformanceReport] = None,
     negative_keywords: Optional[list[NegativeKeyword]] = None,
+    change_history: Optional[list[ChangeEvent]] = None,
 ) -> str:
     """Format campaign data with pre-computed anomalies highlighted."""
 
@@ -592,6 +594,38 @@ def _prepare_campaign_data(
             data_parts.append(f"    Headlines: {headlines_str}")
             data_parts.append(f"    Imp:{ad.impressions:,} Klicks:{ad.clicks} CTR:{ad.ctr:.1f}% CPC:{ad.avg_cpc:.2f}€ Kosten:{ad.cost:.2f}€ {conv_str}{flag}")
 
+    # ---- CHANGE HISTORY ----
+    if change_history:
+        data_parts.append("\n" + "-" * 40)
+        data_parts.append(f"📋 ACCOUNT-ÄNDERUNGSPROTOKOLL ({len(change_history)} Änderungen)")
+        data_parts.append("-" * 40)
+        data_parts.append("  (Berücksichtige bereits durchgeführte Optimierungen — nicht erneut vorschlagen!)")
+        # Map resource types to readable German
+        type_map = {
+            "CAMPAIGN": "Kampagne",
+            "AD_GROUP": "Anzeigengruppe",
+            "AD_GROUP_CRITERION": "Keyword/Kriterium",
+            "CAMPAIGN_CRITERION": "Kampagnen-Kriterium",
+            "AD": "Anzeige",
+            "AD_GROUP_AD": "Anzeige",
+            "CAMPAIGN_BUDGET": "Budget",
+            "AD_GROUP_BID_MODIFIER": "Gebotsanpassung",
+        }
+        op_map = {"CREATE": "Erstellt", "UPDATE": "Geändert", "REMOVE": "Entfernt"}
+        for evt in change_history[:30]:  # Cap at 30 to save tokens
+            dt = evt.change_date_time[:16].replace("T", " ")  # trim seconds
+            res_type = type_map.get(evt.resource_type, evt.resource_type)
+            op = op_map.get(evt.operation, evt.operation)
+            fields_str = ", ".join(evt.changed_fields[:5]) if evt.changed_fields else ""
+            if len(evt.changed_fields) > 5:
+                fields_str += f" (+{len(evt.changed_fields) - 5} more)"
+            user = evt.user_email.split("@")[0] if evt.user_email else "System"
+            line = f"  {dt} | {op} {res_type} | {evt.campaign_name}"
+            if fields_str:
+                line += f" | Felder: {fields_str}"
+            line += f" | von {user}"
+            data_parts.append(line)
+
     # ---- NEGATIVE KEYWORDS ----
     if negative_keywords:
         data_parts.append("\n" + "-" * 40)
@@ -646,6 +680,7 @@ def analyze_campaigns(
     ad_data: Optional[AdPerformanceReport] = None,
     model_name: Optional[str] = None,
     negative_keywords: Optional[list[NegativeKeyword]] = None,
+    change_history: Optional[list[ChangeEvent]] = None,
 ) -> AnalysisResponse:
     """
     Send campaign data to Gemini for analysis and get recommendations.
@@ -662,6 +697,7 @@ def analyze_campaigns(
         hourly_data=hourly_data,
         ad_data=ad_data,
         negative_keywords=negative_keywords,
+        change_history=change_history,
     )
 
     # Check if we have a cached analysis for this exact data
@@ -796,6 +832,7 @@ def _prepare_compact_summary(
     overview: CampaignOverview,
     keywords: Optional[list[KeywordMetrics]] = None,
     negative_keywords: Optional[list[NegativeKeyword]] = None,
+    change_history: Optional[list[ChangeEvent]] = None,
 ) -> str:
     """
     Create a compact data summary for chat — uses ~60-70% fewer tokens
@@ -831,6 +868,21 @@ def _prepare_compact_summary(
         for n in negative_keywords[:30]:
             parts.append(f"  🚫 [{n.match_type}] \"{n.keyword_text}\" ({n.level})")
 
+    if change_history:
+        type_map = {
+            "CAMPAIGN": "Kampagne", "AD_GROUP": "Anzeigengruppe",
+            "AD_GROUP_CRITERION": "Keyword", "CAMPAIGN_CRITERION": "Kamp.-Kriterium",
+            "AD": "Anzeige", "AD_GROUP_AD": "Anzeige", "CAMPAIGN_BUDGET": "Budget",
+        }
+        op_map = {"CREATE": "+", "UPDATE": "→", "REMOVE": "−"}
+        parts.append(f"\nLetzte Änderungen ({len(change_history)}):")
+        for evt in change_history[:15]:
+            dt = evt.change_date_time[:10]
+            res = type_map.get(evt.resource_type, evt.resource_type)
+            op = op_map.get(evt.operation, evt.operation)
+            fields = ", ".join(evt.changed_fields[:3]) if evt.changed_fields else ""
+            parts.append(f"  {dt} {op}{res} {evt.campaign_name} {fields}")
+
     return "\n".join(parts)
 
 
@@ -840,6 +892,7 @@ def chat_about_campaigns(
     keywords: Optional[list[KeywordMetrics]] = None,
     model_name: Optional[str] = None,
     negative_keywords: Optional[list[NegativeKeyword]] = None,
+    change_history: Optional[list[ChangeEvent]] = None,
 ) -> str:
     """
     Have a conversational exchange about campaign data.
@@ -848,7 +901,7 @@ def chat_about_campaigns(
     _configure_gemini()
 
     # Use compact summary instead of full data dump — saves ~60% tokens
-    compact_data = _prepare_compact_summary(overview, keywords, negative_keywords)
+    compact_data = _prepare_compact_summary(overview, keywords, negative_keywords, change_history)
 
     chat_prompt = f"""Aktuelle Google Ads Daten:
 

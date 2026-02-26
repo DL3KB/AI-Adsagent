@@ -70,6 +70,15 @@ class NegativeKeyword(BaseModel):
     ad_group_id: Optional[str] = None
     ad_group_name: Optional[str] = None
 
+class ChangeEvent(BaseModel):
+    """A single change event from the account changelog."""
+    change_date_time: str
+    resource_type: str  # CAMPAIGN, AD_GROUP, AD_GROUP_CRITERION, CAMPAIGN_CRITERION, AD, etc.
+    operation: str  # CREATE, UPDATE, REMOVE
+    changed_fields: list[str] = []
+    user_email: str = ""
+    campaign_id: str = ""
+    campaign_name: str = ""
 
 class SearchTermMetrics(BaseModel):
     """A single search term that triggered an ad."""

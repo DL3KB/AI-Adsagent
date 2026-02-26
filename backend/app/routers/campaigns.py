@@ -546,6 +546,9 @@ def analyze_campaigns(request: AnalysisRequest):
         # Fetch negative keywords to show what's already been excluded
         negative_keywords = google_ads_service.get_negative_keywords(campaign_id=campaign_id)
 
+        # Fetch account change history for context on recent optimizations
+        change_history = google_ads_service.get_change_history(campaign_id=campaign_id, date_range=date_range)
+
         # Run AI analysis with enriched data
         analysis = gemini_service.analyze_campaigns(
             overview=overview,
@@ -557,6 +560,7 @@ def analyze_campaigns(request: AnalysisRequest):
             ad_data=ad_report,
             model_name=request.model,
             negative_keywords=negative_keywords,
+            change_history=change_history,
         )
 
         # Store proposals for later execution
@@ -589,6 +593,7 @@ def chat_about_campaigns(
         overview = google_ads_service.get_campaigns(date_range=date_range, campaign_ids=campaign_ids)
         keywords = google_ads_service.get_keywords(date_range=date_range, campaign_id=campaign_id)
         negative_keywords = google_ads_service.get_negative_keywords(campaign_id=campaign_id)
+        change_history = google_ads_service.get_change_history(campaign_id=campaign_id, date_range=date_range)
 
         response = gemini_service.chat_about_campaigns(
             overview=overview,
@@ -596,6 +601,7 @@ def chat_about_campaigns(
             keywords=keywords,
             model_name=model,
             negative_keywords=negative_keywords,
+            change_history=change_history,
         )
 
         return {"answer": response}
