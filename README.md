@@ -89,10 +89,10 @@ GOOGLE_ADS_DEVELOPER_TOKEN=your-developer-token
 GOOGLE_ADS_CLIENT_ID=your-client-id.apps.googleusercontent.com
 GOOGLE_ADS_CLIENT_SECRET=your-client-secret
 GOOGLE_ADS_REFRESH_TOKEN=your-refresh-token
-GOOGLE_ADS_CUSTOMER_ID=your-customer-id-without-dashes
+GOOGLE_ADS_CUSTOMER_ID=your-customer-id  # without dashes
 
 # Optional: MCC (Manager Account)
-GOOGLE_ADS_LOGIN_CUSTOMER_ID=your-mcc-customer-id-without-dashes
+GOOGLE_ADS_LOGIN_CUSTOMER_ID=your-mcc-customer-id  # without dashes
 
 # Gemini API
 GEMINI_API_KEY=your-gemini-api-key
